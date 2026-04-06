@@ -1,0 +1,28 @@
+{
+  "https://www.teraboxdl.site/": {
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "cookies": [
+      {
+        "domain": ".teraboxdl.site",
+        "expiry": 1810060646,
+        "httpOnly": false,
+        "name": "_ga",
+        "path": "/",
+        "sameSite": "Lax",
+        "secure": false,
+        "value": "GA1.2.1347348942.1775500647"
+      },
+      {
+        "domain": ".teraboxdl.site",
+        "expiry": 1810060646,
+        "httpOnly": false,
+        "name": "_ga_YBK6ZYJP65",
+        "path": "/",
+        "sameSite": "Lax",
+        "secure": false,
+        "value": "GS2.2.s1775500646$o1$g0$t1775500646$j60$l0$h0"
+      }
+    ],
+    "cached_at": 1775500647
+  }
+}
