@@ -5,13 +5,13 @@ Run this from outside the container on your Windows machine.
 import requests
 import json
 
-FLARE_URL = "https://flaresolverr-latest-ympl.onrender.com/v1"
+FLARE_URL = "http://localhost:8191/v1"
 
 headers = {"Content-Type": "application/json"}
 
 payload = {
     "cmd": "request.get",
-    "url": "https://www.teraboxdl.site/",
+    "url": "__",
 }
 
 print("Sending request.get to FlareSolverr...")
