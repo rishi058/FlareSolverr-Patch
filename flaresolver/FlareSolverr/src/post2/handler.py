@@ -21,9 +21,6 @@ import requests as stdlib_requests
 from dtos import STATUS_OK, STATUS_ERROR, V1RequestBase, V1ResponseBase
 from post2 import db
 
-# Internal FlareSolverr URL (loopback, always works inside the container)
-_FLARE_URL = "http://localhost:8191/v1"
-
 
 # ──────────────────────────────────────────────
 # Public entry point
@@ -111,38 +108,54 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
 
 def _solve_and_cache(base_url: str, max_timeout: int) -> dict | None:
     """
-    Call FlareSolverr's own request.get on base_url to solve the CF challenge,
-    then persist the session to db.json and return a session dict.
+    Directly invoke FlareSolverr's internal request.get handler to solve the
+    CF challenge (no HTTP round-trip — works on Render / any platform).
+    Persists full session data (cookies, headers incl. User-Agent)
+    to db.json and returns a session dict.
     Returns None on failure.
     """
+    # Lazy import to avoid circular dependency
+    # (flaresolverr_service imports post2.handler at module level)
+    from flaresolverr_service import _cmd_request_get
+
     try:
-        resp = stdlib_requests.post(
-            _FLARE_URL,
-            json={
-                "cmd": "request.get",
-                "url": base_url,
-                "maxTimeout": max_timeout,
-                "returnOnlyCookies": True,
-            },
-            timeout=max_timeout / 1000 + 10,
-        )
-        data = resp.json()
+        # Build a minimal V1RequestBase for request.get
+        internal_req = V1RequestBase({
+            "cmd": "request.get",
+            "url": base_url,
+            "maxTimeout": max_timeout,
+            "returnOnlyCookies": False,  # we want headers too
+        })
+        res = _cmd_request_get(internal_req)
     except Exception as e:
-        logging.error(f"[post2] Error calling FlareSolverr for {base_url}: {e}")
+        logging.error(f"[post2] Error solving CF challenge for {base_url}: {e}")
         return None
 
-    if data.get("status") != "ok":
-        logging.error(f"[post2] CF challenge failed for {base_url}: {data.get('message')}")
+    if res.status != STATUS_OK:
+        logging.error(f"[post2] CF challenge failed for {base_url}: {res.message}")
         return None
 
-    solution = data["solution"]
-    user_agent = solution["userAgent"]
-    cookies = solution["cookies"]      # list of Selenium cookie dicts
+    solution = res.solution
+    if solution is None:
+        logging.error(f"[post2] No solution returned for {base_url}")
+        return None
 
-    db.put(base_url, user_agent, cookies)
-    logging.info(f"[post2] Challenge solved for {base_url}, session cached.")
+    user_agent = solution.userAgent or ""
+    cookies = solution.cookies or []        # list of Selenium cookie dicts
+    headers = solution.headers or {}        # response headers (if available)
+    # Merge User-Agent into headers so everything lives in one place
+    headers["User-Agent"] = user_agent
+    # NOTE: cf_clearance is already inside `cookies` as a dict with
+    #       {"name": "cf_clearance", "value": "...", ...}
+    #       No need to extract it separately — it's saved with all cookies.
 
-    return {"userAgent": user_agent, "cookies": cookies}
+    db.put(base_url, cookies, headers)
+    logging.info(f"[post2] Challenge solved for {base_url}, full session cached.")
+
+    return {
+        "cookies": cookies,
+        "headers": headers,
+    }
 
 
 def _do_post(post_url: str, json_body: dict, session: dict):
@@ -151,7 +164,6 @@ def _do_post(post_url: str, json_body: dict, session: dict):
     Returns (response_data, status_code, error_message).
     response_data is the parsed JSON if successful, or raw text otherwise.
     """
-    user_agent = session["userAgent"]
     cookies_list = session["cookies"]
     # Selenium returns cookies as list of dicts; requests needs name→value dict
     cookies_dict = {c["name"]: c["value"] for c in cookies_list}
@@ -163,7 +175,7 @@ def _do_post(post_url: str, json_body: dict, session: dict):
     referer = origin + "/"
 
     headers = {
-        "User-Agent": user_agent,
+        "User-Agent": session["headers"].get("User-Agent", ""),
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Origin": origin,

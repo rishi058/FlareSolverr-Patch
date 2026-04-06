@@ -1,7 +1,7 @@
 """
 post2/db.py — Thread-safe JSON database for caching Cloudflare session data.
 
-Stores:  { "https://teraboxdl.site/": { "userAgent": "...", "cookies": [...], "cached_at": 1234 } }
+Stores:  { "https://teraboxdl.site/": { "headers": {"User-Agent": "...", ...}, "cookies": [...], "cached_at": 1234 } }
 File lives at /config/post2_db.json inside the container (or a path set by POST2_DB_PATH env var).
 """
 import json
@@ -43,13 +43,18 @@ def get(base_url: str) -> dict | None:
         return db.get(base_url)
 
 
-def put(base_url: str, user_agent: str, cookies: list) -> None:
-    """Store/overwrite session data for base_url."""
+def put(base_url: str, cookies: list, headers: dict) -> None:
+    """Store/overwrite session data for base_url.
+
+    Saves cookies (including cf_clearance) and headers (including User-Agent).
+    cf_clearance is already inside the cookies list
+    as a dict with {"name": "cf_clearance", "value": "..."}.
+    """
     with _lock:
         db = _load()
         db[base_url] = {
-            "userAgent": user_agent,
-            "cookies": cookies,           # list of Selenium cookie dicts
+            "cookies": cookies,
+            "headers": headers,
             "cached_at": int(time.time()),
         }
         _save(db)

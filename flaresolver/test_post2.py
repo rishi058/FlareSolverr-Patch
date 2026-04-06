@@ -7,13 +7,12 @@ import json
 
 FLARE_URL = "http://localhost:8191/v1"
 
-# payload = {
-#     "cmd": "request.post2",
-#     "base_url": "__",
-#     "post_endpoint": "__",
-#     "post_json_body": "__"
-# }
-
+payload = {
+    "cmd": "request.post2",
+    "base_url": "__",
+    "post_endpoint": "__",
+    "post_json_body": "__"
+}
 
 print("Sending request.post2 to FlareSolverr...")
 res = requests.post(FLARE_URL, json=payload, timeout=600)
