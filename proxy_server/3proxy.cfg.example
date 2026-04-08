@@ -1,0 +1,20 @@
+# --- Authentication ---
+# For Docker tests, Chrome doesn't support SOCKS5 auth natively.
+
+# We will use no authentication, but bind ONLY to your local/private IP!
+# auth none
+auth none
+
+# --- Logging ---
+log "C:\3proxy\logs\3proxy.log" D
+logformat "L%d-%m-%Y %H:%M:%S %N.%p %E %C:%c %R:%r %O %I %h %T"
+rotate 7
+
+
+socks -p1080
+
+# --- Timeouts ---
+timeouts 1 5 30 60 180 1800 15 60
+
+# --- Max Connections ---
+maxconn 32

@@ -13,6 +13,8 @@ request.post2 flow:
 """
 import json
 import logging
+import os
+import threading
 import time
 from urllib.parse import urljoin
 
@@ -20,6 +22,26 @@ import requests as stdlib_requests
 
 from dtos import STATUS_OK, STATUS_ERROR, V1RequestBase, V1ResponseBase
 from post2 import db
+
+
+# ──────────────────────────────────────────────
+# Concurrency controls
+# ──────────────────────────────────────────────
+# Global limit on simultaneous browser instances (configurable via env)
+_MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
+_browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
+
+# Per-URL coalescing: only one inflight solve per base_url
+_url_locks: dict[str, threading.Lock] = {}
+_url_locks_guard = threading.Lock()
+
+
+def _get_url_lock(base_url: str) -> threading.Lock:
+    """Return (or create) a per-URL lock for coalescing concurrent solves."""
+    with _url_locks_guard:
+        if base_url not in _url_locks:
+            _url_locks[base_url] = threading.Lock()
+        return _url_locks[base_url]
 
 
 # ──────────────────────────────────────────────
@@ -53,15 +75,26 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
     max_timeout = int(req.maxTimeout or 60000)
     logging.info(f"[post2] base_url={base_url}  post_url={post_url}")
 
-    # ── Step 1: Ensure we have a cached session ───────────────────────────
+    # ── Step 1: Fast path — check cache without any lock ─────────────────
     session = db.get(base_url)
+
     if session is None:
-        logging.info(f"[post2] Cache MISS for {base_url} — solving CF challenge...")
-        session = _solve_and_cache(base_url, max_timeout)
-        if session is None:
-            return _error_response(
-                f"Failed to solve Cloudflare challenge for {base_url}.", start_ts
-            )
+        # Coalesced solve: per-URL lock ensures only one browser solve
+        url_lock = _get_url_lock(base_url)
+        with url_lock:
+            # Double-check: another thread may have just solved & cached it
+            session = db.get(base_url)
+            if session is None:
+                logging.info(f"[post2] Cache MISS for {base_url} — solving CF challenge...")
+                _browser_semaphore.acquire()
+                try:
+                    session = _solve_and_cache(base_url, max_timeout)
+                finally:
+                    _browser_semaphore.release()
+                if session is None:
+                    return _error_response(
+                        f"Failed to solve Cloudflare challenge for {base_url}.", start_ts
+                    )
 
     # ── Step 2: Make the JSON POST ────────────────────────────────────────
     resp_data, status_code, error = _do_post(post_url, json_body, session)
@@ -70,11 +103,20 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
     if status_code == 403:
         logging.info(f"[post2] Got 403 — evicting cache and retrying once for {base_url}")
         db.remove(base_url)
-        session = _solve_and_cache(base_url, max_timeout)
-        if session is None:
-            return _error_response(
-                "Got 403 and failed to refresh Cloudflare session.", start_ts
-            )
+        url_lock = _get_url_lock(base_url)
+        with url_lock:
+            # Re-check: another concurrent 403-retry may have already re-solved
+            session = db.get(base_url)
+            if session is None:
+                _browser_semaphore.acquire()
+                try:
+                    session = _solve_and_cache(base_url, max_timeout)
+                finally:
+                    _browser_semaphore.release()
+                if session is None:
+                    return _error_response(
+                        "Got 403 and failed to refresh Cloudflare session.", start_ts
+                    )
         resp_data, status_code, error = _do_post(post_url, json_body, session)
 
     # ── Build response ────────────────────────────────────────────────────
