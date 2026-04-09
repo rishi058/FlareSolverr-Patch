@@ -47,3 +47,9 @@ A "config" folder will appear in your current directory with post2_db.json
 
 ### Remove Container (required before re-running):
 - docker rm flaresolverr
+
+### PUSH TO GITHUB
+
+docker build -t ghcr.io/rishi058/flaresolverr .
+
+docker push ghcr.io/rishi058/flaresolverr

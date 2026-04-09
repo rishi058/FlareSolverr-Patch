@@ -25,11 +25,19 @@ from post2 import db
 
 
 # ──────────────────────────────────────────────
-# Concurrency controls
+# Concurrency controls & timeouts
 # ──────────────────────────────────────────────
-# Global limit on simultaneous browser instances (configurable via env)
+# Global limit on simultaneous browser instances (configurable via env).
+# Default is 1 — Render free tier has ~512 MB RAM; one headless Chrome
+# already consumes ~200-300 MB. Set MAX_BROWSERS=2 only on larger plans.
 _MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
 _browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
+
+# Timeout for the internal CF-challenge solve (ms).
+# Deliberately decoupled from req.maxTimeout — CF challenges need time;
+# the outer client can have a shorter timeout and retry independently.
+# Render free containers are slow: 120 s gives Chrome a realistic window.
+_CF_SOLVE_TIMEOUT_MS = int(os.environ.get("CF_SOLVE_TIMEOUT_MS", "180000")) # 180s = 3 min
 
 # Per-URL coalescing: only one inflight solve per base_url
 _url_locks: dict[str, threading.Lock] = {}
@@ -72,7 +80,6 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
     except (json.JSONDecodeError, TypeError) as e:
         return _error_response(f"'post_json_body' is not valid JSON: {e}", start_ts)
 
-    max_timeout = int(req.maxTimeout or 60000)
     logging.info(f"[post2] base_url={base_url}  post_url={post_url}")
 
     # ── Step 1: Fast path — check cache without any lock ─────────────────
@@ -88,10 +95,13 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
                 logging.info(f"[post2] Cache MISS for {base_url} — solving CF challenge...")
                 _browser_semaphore.acquire()
                 try:
-                    session = _solve_and_cache(base_url, max_timeout)
+                    session = _solve_and_cache(base_url)
                 finally:
                     _browser_semaphore.release()
                 if session is None:
+                    # Brief pause: prevents the caller from hammering the server
+                    # immediately after a Chrome crash / OOM kill.
+                    time.sleep(5)
                     return _error_response(
                         f"Failed to solve Cloudflare challenge for {base_url}.", start_ts
                     )
@@ -110,10 +120,11 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
             if session is None:
                 _browser_semaphore.acquire()
                 try:
-                    session = _solve_and_cache(base_url, max_timeout)
+                    session = _solve_and_cache(base_url)
                 finally:
                     _browser_semaphore.release()
                 if session is None:
+                    time.sleep(5)
                     return _error_response(
                         "Got 403 and failed to refresh Cloudflare session.", start_ts
                     )
@@ -148,13 +159,17 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
 # Helpers
 # ──────────────────────────────────────────────
 
-def _solve_and_cache(base_url: str, max_timeout: int) -> dict | None:
+def _solve_and_cache(base_url: str) -> dict | None:
     """
     Directly invoke FlareSolverr's internal request.get handler to solve the
     CF challenge (no HTTP round-trip — works on Render / any platform).
     Persists full session data (cookies, headers incl. User-Agent)
     to db.json and returns a session dict.
     Returns None on failure.
+
+    Uses _CF_SOLVE_TIMEOUT_MS (env: CF_SOLVE_TIMEOUT_MS, default 120 s)
+    instead of the outer request's maxTimeout — CF challenges need their own
+    window independent of what the client specified.
     """
     # Lazy import to avoid circular dependency
     # (flaresolverr_service imports post2.handler at module level)
@@ -165,7 +180,7 @@ def _solve_and_cache(base_url: str, max_timeout: int) -> dict | None:
         internal_req = V1RequestBase({
             "cmd": "request.get",
             "url": base_url,
-            "maxTimeout": max_timeout,
+            "maxTimeout": _CF_SOLVE_TIMEOUT_MS,
             "returnOnlyCookies": False,  # we want headers too
         })
         res = _cmd_request_get(internal_req)
@@ -230,7 +245,7 @@ def _do_post(post_url: str, json_body: dict, session: dict):
             headers=headers,
             cookies=cookies_dict,
             json=json_body,
-            timeout=30,
+            timeout=60,
         )
         status_code = resp.status_code
         logging.info(f"[post2] POST {post_url} → HTTP {status_code}")
