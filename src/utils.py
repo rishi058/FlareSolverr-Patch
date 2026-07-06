@@ -141,12 +141,23 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     # todo: this param shows a warning in chrome head-full
     options.add_argument('--disable-setuid-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
-    options.add_argument('--no-zygote')
-    # attempt to fix Docker ARM32 build
     IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
+    logging.info("[utils] platform.machine()=%s IS_ARMARCH=%s", platform.machine(), IS_ARMARCH)
+    if not IS_ARMARCH:
+        # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
+        # However, it causes SIGTRAP (exit code -5) crashes on ARM64 Docker.
+        options.add_argument('--no-zygote')
+        logging.debug("[utils] Added --no-zygote (x86 only)")
+    
+    # attempt to fix Docker ARM32/ARM64 build
     if IS_ARMARCH:
         options.add_argument('--disable-gpu-sandbox')
+        options.add_argument('--disable-gpu')          # no GPU/DRM on Oracle Cloud ARM VMs
+        options.add_argument('--disable-software-rasterizer')
+        options.add_argument('--single-process')       # prevents IPC/fork crashes on some ARM kernels
+        os.environ['DBUS_SESSION_BUS_ADDRESS'] = '/dev/null' # suppress DBus fatal traps
+        logging.info("[utils] ARM flags added: disable-gpu-sandbox, disable-gpu, disable-software-rasterizer, single-process, DBUS=/dev/null")
+
     options.add_argument('--ignore-certificate-errors')
     options.add_argument('--ignore-ssl-errors')
 
@@ -168,39 +179,65 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         logging.debug("Using webdriver proxy: %s", proxy_url)
         options.add_argument('--proxy-server=%s' % proxy_url)
 
-    # note: headless mode is detected (headless = True)
-    # we launch the browser in head-full mode with the window hidden
+    # Headless strategy:
+    # - Windows: use UC's windows_headless mode
+    # - ARM Linux (Oracle Cloud etc.): use --headless=new via UC's headless param.
+    #   use_subprocess=True avoids start_detached (double-fork) which crashes on ARM.
+    #   Port-readiness wait in UC handles the slow Chrome startup.
+    # - x86 Linux: use Xvfb (head-full behind virtual display, less detectable)
+    #   Falls back to --headless=new if Xvfb fails.
     windows_headless = False
+    headless_flag = False
+    use_subprocess = False
     if get_config_headless():
         if os.name == 'nt':
             windows_headless = True
+            logging.info("[utils] Headless mode: windows_headless")
+        elif IS_ARMARCH:
+            # ARM: skip Xvfb, use subprocess mode (start_detached crashes on ARM)
+            logging.info('[utils] ARM detected — using headless=True + use_subprocess=True + port-wait')
+            headless_flag = True
+            use_subprocess = True
         else:
-            start_xvfb_display()
-    # For normal headless mode:
-    # options.add_argument('--headless')
-
+            xvfb_ok = start_xvfb_display()
+            if not xvfb_ok:
+                # Native headless fallback — works without any display server
+                logging.info("[utils] Xvfb unavailable — falling back to --headless=new")
+                headless_flag = True
+    
     # if we are inside the Docker container, we avoid downloading the driver
     driver_exe_path = None
     version_main = None
     if os.path.exists("/app/chromedriver"):
         # running inside Docker
         driver_exe_path = "/app/chromedriver"
+        logging.info("[utils] Docker mode: using pre-installed chromedriver at %s", driver_exe_path)
     else:
         version_main = get_chrome_major_version()
+        logging.info("[utils] Non-Docker mode: Chrome major version=%s", version_main)
         if PATCHED_DRIVER_PATH is not None:
             driver_exe_path = PATCHED_DRIVER_PATH
+            logging.info("[utils] Reusing cached patched driver at %s", driver_exe_path)
 
     # detect chrome path
     browser_executable_path = get_chrome_exe_path()
+    logging.info("[utils] Browser executable: %s", browser_executable_path)
 
     # downloads and patches the chromedriver
     # if we don't set driver_executable_path it downloads, patches, and deletes the driver each time
+    logging.info(
+        "[utils] uc.Chrome() call — browser=%s driver=%s version_main=%s "
+        "windows_headless=%s headless=%s use_subprocess=%s",
+        browser_executable_path, driver_exe_path, version_main,
+        windows_headless, headless_flag, use_subprocess
+    )
     try:
         driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path,
                            driver_executable_path=driver_exe_path, version_main=version_main,
-                           windows_headless=windows_headless, headless=get_config_headless())
+                           windows_headless=windows_headless, headless=headless_flag,
+                           use_subprocess=use_subprocess)
     except Exception as e:
-        logging.error("Error starting Chrome: %s" % e)
+        logging.error("[utils] Error starting Chrome: %s", e)
         # No point in continuing if we cannot retrieve the driver
         raise e
 
@@ -209,18 +246,13 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         PATCHED_DRIVER_PATH = os.path.join(driver.patcher.data_path, driver.patcher.exe_name)
         if PATCHED_DRIVER_PATH != driver.patcher.executable_path:
             shutil.copy(driver.patcher.executable_path, PATCHED_DRIVER_PATH)
+            logging.debug("[utils] Cached patched driver to %s", PATCHED_DRIVER_PATH)
+
+    logging.info("[utils] WebDriver launched successfully")
 
     # clean up proxy extension directory
     if proxy_extension_dir is not None:
         shutil.rmtree(proxy_extension_dir)
-
-    # selenium vanilla
-    # options = webdriver.ChromeOptions()
-    # options.add_argument('--no-sandbox')
-    # options.add_argument('--window-size=1920,1080')
-    # options.add_argument('--disable-setuid-sandbox')
-    # options.add_argument('--disable-dev-shm-usage')
-    # driver = webdriver.Chrome(options=options)
 
     return driver
 
@@ -236,11 +268,13 @@ def get_chrome_exe_path() -> str:
             raise Exception(f'Chrome binary "{chrome_path}" is not executable. '
                             f'Please, extract the archive with "tar xzf <file.tar.gz>".')
         CHROME_EXE_PATH = chrome_path
+        logging.info("[utils] Chrome found (linux pyinstaller bundle): %s", CHROME_EXE_PATH)
         return CHROME_EXE_PATH
     # windows pyinstaller bundle
     chrome_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chrome', "chrome.exe")
     if os.path.exists(chrome_path):
         CHROME_EXE_PATH = chrome_path
+        logging.info("[utils] Chrome found (windows pyinstaller bundle): %s", CHROME_EXE_PATH)
         return CHROME_EXE_PATH
     # ARM Linux: Debian/Ubuntu package manager installs Chromium as
     # /usr/bin/chromium (or /usr/bin/chromium-browser). These paths are
@@ -251,9 +285,11 @@ def get_chrome_exe_path() -> str:
     for _candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
         if os.path.exists(_candidate):
             CHROME_EXE_PATH = _candidate
+            logging.info("[utils] Chrome found (ARM distro candidate): %s", CHROME_EXE_PATH)
             return CHROME_EXE_PATH
     # system (searches for google-chrome, chromium, etc.)
     CHROME_EXE_PATH = uc.find_chrome_executable()
+    logging.info("[utils] Chrome found (uc.find_chrome_executable): %s", CHROME_EXE_PATH)
     return CHROME_EXE_PATH
 
 
@@ -343,12 +379,29 @@ def get_user_agent(driver=None) -> str:
             driver.quit()
 
 
-def start_xvfb_display():
+def start_xvfb_display() -> bool:
+    """
+    Start a virtual X display (Xvfb) for headless Chrome.
+    Returns True if Xvfb started and produced a usable DISPLAY,
+    False if it failed (caller should fall back to --headless=new).
+    """
     global XVFB_DISPLAY
-    if XVFB_DISPLAY is None:
+    if XVFB_DISPLAY is not None:
+        return True
+    try:
         from xvfbwrapper import Xvfb
+        logging.info("[utils] Starting Xvfb virtual display...")
         XVFB_DISPLAY = Xvfb()
         XVFB_DISPLAY.start()
+        # Verify that a real DISPLAY was registered (fails silently on some ARM VMs)
+        if not os.environ.get('DISPLAY'):
+            raise RuntimeError('Xvfb started but DISPLAY env var is not set')
+        logging.info("[utils] Xvfb started, DISPLAY=%s", os.environ.get('DISPLAY'))
+        return True
+    except Exception as e:
+        logging.warning(f'[utils] Xvfb failed to start ({e}); falling back to --headless=new')
+        XVFB_DISPLAY = None
+        return False
 
 
 def object_to_dict(_object):

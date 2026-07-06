@@ -26,6 +26,8 @@ import pathlib
 import re
 import shutil
 import subprocess
+import platform
+import socket
 import sys
 import tempfile
 import time
@@ -446,16 +448,25 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         if not desired_capabilities:
             desired_capabilities = options.to_capabilities()
 
+        _machine = platform.machine().lower()
+        _is_arm = _machine in ("aarch64", "arm64", "armv7l", "armv6l")
+        logger.info("[UC] Launching browser: binary=%s use_subprocess=%s arm=%s",
+                    options.binary_location, use_subprocess, _is_arm)
+        logger.debug("[UC] Full browser arguments: %s", options.arguments)
+
         if not use_subprocess and not windows_headless:
+            logger.info("[UC] Spawning browser via start_detached (double-fork)")
             self.browser_pid = start_detached(
                 options.binary_location, *options.arguments
             )
+            logger.info("[UC] Browser PID (detached): %s", self.browser_pid)
         else:
             startupinfo = None
             if os.name == 'nt' and windows_headless:
                 # STARTUPINFO() is Windows only
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            logger.info("[UC] Spawning browser via subprocess.Popen")
             browser = subprocess.Popen(
                 [options.binary_location, *options.arguments],
                 stdin=subprocess.PIPE,
@@ -465,17 +476,49 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                 startupinfo=startupinfo
             )
             self.browser_pid = browser.pid
+            logger.info("[UC] Browser PID (subprocess): %s", self.browser_pid)
+
+            # On ARM64, Chrome takes significantly longer to open its remote
+            # debugging port than on x86. Poll until the port is ready so
+            # Selenium does not fail with 'cannot connect to chrome'.
+            # Use a longer timeout on ARM; x86 typically connects in < 2s.
+            port_timeout = 90 if _is_arm else 30
+            logger.info("[UC] Waiting for Chrome debug port %s:%s (timeout=%ds, arm=%s)",
+                        debug_host, debug_port, port_timeout, _is_arm)
+            port_ready = Chrome._wait_for_port(debug_host, debug_port, port_timeout)
+            if port_ready:
+                logger.info("[UC] Chrome debug port is ready")
+            else:
+                # Collect stderr from the still-running (or dead) browser process
+                try:
+                    browser_stderr = browser.stderr.read(4096).decode(errors='replace')
+                except Exception:
+                    browser_stderr = "<could not read stderr>"
+                rc = browser.poll()
+                logger.error(
+                    "[UC] Chrome debug port %s:%s NOT ready after %ds. "
+                    "Browser exit code: %s. Stderr:\n%s",
+                    debug_host, debug_port, port_timeout, rc, browser_stderr
+                )
+                raise RuntimeError(
+                    f"Chrome debug port {debug_host}:{debug_port} not ready after "
+                    f"{port_timeout}s (exit_code={rc}). "
+                    f"Stderr: {browser_stderr[:300]}"
+                )
 
 
+        logger.info("[UC] Starting ChromiumService with driver: %s", self.patcher.executable_path)
         service = selenium.webdriver.chromium.service.ChromiumService(
             self.patcher.executable_path
         )
 
+        logger.info("[UC] Calling super().__init__ (Selenium WebDriver handshake)")
         super().__init__(
             service=service,
             options=options,
             keep_alive=keep_alive,
         )
+        logger.info("[UC] WebDriver session created successfully: session_id=%s", self.session_id)
 
         self.reactor = None
 
@@ -852,6 +895,34 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         except:  # noqa
             pass
         self.quit()
+
+    @staticmethod
+    def _wait_for_port(host: str, port: int, timeout: int = 60) -> bool:
+        """
+        Block until the TCP port at host:port is accepting connections,
+        or until `timeout` seconds have elapsed.
+
+        Returns True if the port opened within the timeout, False otherwise.
+        This is critical on ARM64 hosts where Chrome can take 10-30 seconds
+        to start its remote debugging server.
+        """
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    logger.debug("[UC] Port %s:%s open after %d attempt(s)", host, port, attempt)
+                    return True
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                remaining = deadline - time.monotonic()
+                if attempt % 10 == 0:  # log every 10 attempts (~5s)
+                    logger.debug(
+                        "[UC] Port %s:%s not yet open (attempt %d, %.1fs remaining)",
+                        host, port, attempt, remaining
+                    )
+                time.sleep(0.5)
+        return False
 
     @classmethod
     def _ensure_close(cls, self):
