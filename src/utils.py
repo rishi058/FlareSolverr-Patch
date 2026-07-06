@@ -143,11 +143,9 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--disable-dev-shm-usage')
     IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
     logging.info("[utils] platform.machine()=%s IS_ARMARCH=%s", platform.machine(), IS_ARMARCH)
-    if not IS_ARMARCH:
-        # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
-        # However, it causes SIGTRAP (exit code -5) crashes on ARM64 Docker.
-        options.add_argument('--no-zygote')
-        logging.debug("[utils] Added --no-zygote (x86 only)")
+    # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
+    options.add_argument('--no-zygote')
+    logging.debug("[utils] Added --no-zygote")
     
     # attempt to fix Docker ARM32/ARM64 build
     if IS_ARMARCH:
@@ -183,10 +181,7 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
 
     # Headless strategy:
     # - Windows: use UC's windows_headless mode
-    # - ARM Linux (Oracle Cloud etc.): use --headless=new via UC's headless param.
-    #   use_subprocess=True avoids start_detached (double-fork) which crashes on ARM.
-    #   Port-readiness wait in UC handles the slow Chrome startup.
-    # - x86 Linux: use Xvfb (head-full behind virtual display, less detectable)
+    # - Linux (all architectures): use Xvfb (head-full behind virtual display, less detectable)
     #   Falls back to --headless=new if Xvfb fails.
     windows_headless = False
     headless_flag = False
@@ -195,12 +190,8 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         if os.name == 'nt':
             windows_headless = True
             logging.info("[utils] Headless mode: windows_headless")
-        elif IS_ARMARCH:
-            # ARM: skip Xvfb, use subprocess mode (start_detached crashes on ARM)
-            logging.info('[utils] ARM detected — using headless=True + use_subprocess=True + port-wait')
-            headless_flag = True
-            use_subprocess = True
         else:
+            # Let ARM use Xvfb just like x86
             xvfb_ok = start_xvfb_display()
             if not xvfb_ok:
                 # Native headless fallback — works without any display server
