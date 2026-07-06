@@ -17,20 +17,17 @@ FROM python:3.13-slim-bookworm
 # Copy dummy packages
 COPY --from=builder /*.deb /
 
-# Install dependencies and create flaresolverr user
-# You can test Chromium running this command inside the container:
-#    xvfb-run -s "-screen 0 1600x1200x24" chromium --no-sandbox
-# The error traces is like this: "*** stack smashing detected ***: terminated"
-# To check the package versions available you can use this command:
-#    apt-cache madison chromium
 WORKDIR /app
     # Install dummy packages
 RUN dpkg -i /libgl1-mesa-dri.deb \
     && dpkg -i /adwaita-icon-theme.deb \
-    # Install dependencies
+    # Install dependencies with strictly pinned Chromium versions
     && apt-get update \
-    && apt-get install -y --no-install-recommends chromium chromium-common chromium-driver xvfb dumb-init \
-        procps curl vim xauth \
+    && apt-get install -y --no-install-recommends \
+       chromium=147.0.7727.137-1~deb12u1 \
+       chromium-common=147.0.7727.137-1~deb12u1 \
+       chromium-driver=147.0.7727.137-1~deb12u1 \
+       xvfb dumb-init procps curl vim xauth \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/lib/*/libmfxhw* \
@@ -65,19 +62,3 @@ EXPOSE 8192
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 
 CMD ["/usr/local/bin/python", "-u", "/app/flaresolverr.py"]
-
-# Local build
-# docker build -t ngosang/flaresolverr:3.4.6 .
-# docker run -p 8191:8191 ngosang/flaresolverr:3.4.6
-
-# Multi-arch build
-# docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-# docker buildx create --use
-# docker buildx build -t ngosang/flaresolverr:3.4.6 --platform linux/386,linux/amd64,linux/arm/v7,linux/arm64/v8 .
-#   add --push to publish in DockerHub
-
-# Test multi-arch build
-# docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-# docker buildx create --use
-# docker buildx build -t ngosang/flaresolverr:3.4.6 --platform linux/arm/v7 --load .
-# docker run -p 8191:8191 --platform linux/arm/v7 ngosang/flaresolverr:3.4.6
