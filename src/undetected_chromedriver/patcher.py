@@ -127,7 +127,21 @@ class Patcher(object):
             self.platform_name = "win32"
             self.exe_name %= ".exe"
         if self.platform.endswith(("linux", "linux2")):
-            self.platform_name = "linux64"
+            # Detect the CPU architecture so we download the correct ChromeDriver
+            # binary for the host. On ARM64 containers (Apple Silicon, Oracle Cloud
+            # ARM, Raspberry Pi) the Google CDN slug is "linux-arm64"; falling back
+            # to "linux64" downloads an AMD64 binary that crashes with
+            # "Exec format error" or a segfault on ARM hosts.
+            _machine = platform.machine().lower()
+            if _machine in ("aarch64", "arm64"):
+                self.platform_name = "linux-arm64"
+            elif _machine in ("armv7l", "armv6l"):
+                # No official Chrome-for-Testing arm32 build exists; the Docker
+                # path (pre-installed distro chromedriver) is the correct solution.
+                # Set a recognisable name so fetch errors are obvious.
+                self.platform_name = "linux-arm"
+            else:
+                self.platform_name = "linux64"
             self.exe_name %= ""
         if self.platform.endswith("darwin"):
             if self.is_old_chromedriver:

@@ -242,7 +242,17 @@ def get_chrome_exe_path() -> str:
     if os.path.exists(chrome_path):
         CHROME_EXE_PATH = chrome_path
         return CHROME_EXE_PATH
-    # system
+    # ARM Linux: Debian/Ubuntu package manager installs Chromium as
+    # /usr/bin/chromium (or /usr/bin/chromium-browser). These paths are
+    # not in uc.find_chrome_executable()'s search list, which looks for
+    # google-chrome / google-chrome-stable instead.
+    # Check these before delegating to UC so ARM Docker containers
+    # always find the correct native binary.
+    for _candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+        if os.path.exists(_candidate):
+            CHROME_EXE_PATH = _candidate
+            return CHROME_EXE_PATH
+    # system (searches for google-chrome, chromium, etc.)
     CHROME_EXE_PATH = uc.find_chrome_executable()
     return CHROME_EXE_PATH
 

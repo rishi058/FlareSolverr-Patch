@@ -33,8 +33,8 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
         procps curl vim xauth \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/lib/x86_64-linux-gnu/libmfxhw* \
-    && rm -f /usr/lib/x86_64-linux-gnu/mfx/* \
+    && rm -f /usr/lib/*/libmfxhw* \
+    && rm -f /usr/lib/*/mfx/* \
     # Create flaresolverr user
     && useradd --home-dir /app --shell /bin/sh flaresolverr \
     && mv /usr/bin/chromedriver chromedriver \
