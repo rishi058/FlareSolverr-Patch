@@ -30,7 +30,7 @@ from post2 import db
 # Global limit on simultaneous browser instances (configurable via env).
 # Default is 1 — Render free tier has ~512 MB RAM; one headless Chrome
 # already consumes ~200-300 MB. Set MAX_BROWSERS=2 only on larger plans.
-_MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
+_MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "3")) 
 _browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
 
 # Timeout for the internal CF-challenge solve (ms).
