@@ -154,9 +154,9 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         options.add_argument('--disable-gpu-sandbox')
         options.add_argument('--disable-gpu')          # no GPU/DRM on Oracle Cloud ARM VMs
         options.add_argument('--disable-software-rasterizer')
-        options.add_argument('--single-process')       # prevents IPC/fork crashes on some ARM kernels
+        # options.add_argument('--single-process')     # CAUSES SIGTRAP on Chromium 150!
         os.environ['DBUS_SESSION_BUS_ADDRESS'] = '/dev/null' # suppress DBus fatal traps
-        logging.info("[utils] ARM flags added: disable-gpu-sandbox, disable-gpu, disable-software-rasterizer, single-process, DBUS=/dev/null")
+        logging.info("[utils] ARM flags added: disable-gpu-sandbox, disable-gpu, disable-software-rasterizer, DBUS=/dev/null")
 
     options.add_argument('--ignore-certificate-errors')
     options.add_argument('--ignore-ssl-errors')
