@@ -503,39 +503,45 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                     debug_host, debug_port, port_timeout, rc, browser_stderr
                 )
 
-                # ── Smart failure diagnosis ──────────────────────────────────
                 # Exit code -5 == SIGTRAP == Chromium's built-in abort() triggered
-                # by a blocked kernel syscall (seccomp filter).  This is 100% a
-                # container-level issue; no Python code can fix it.
+                # by a blocked kernel syscall (seccomp filter) OR an internal assertion failure.
                 if rc == -5:
                     _seccomp = Chrome._read_seccomp_mode()
-                    _hint = (
-                        "\n\n"
-                        "╔══════════════════════════════════════════════════════════════╗\n"
-                        "║  CHROMIUM CRASHED WITH SIGTRAP (exit code -5)               ║\n"
-                        "║  Root cause: Docker seccomp filter is blocking ARM64        ║\n"
-                        f"║  syscalls used by Chromium. Seccomp mode: {_seccomp:<18}║\n"
-                        "║                                                              ║\n"
-                        "║  FIX — Add to your docker-compose.yml / Coolify:            ║\n"
-                        "║                                                              ║\n"
-                        "║    security_opt:                                             ║\n"
-                        "║      - seccomp=unconfined                                   ║\n"
-                        "║    shm_size: '1gb'                                          ║\n"
-                        "║    cap_add:                                                  ║\n"
-                        "║      - SYS_ADMIN                                            ║\n"
-                        "║                                                              ║\n"
-                        "║  OR use the minimal seccomp profile:                        ║\n"
-                        "║    security_opt:                                             ║\n"
-                        "║      - seccomp=/path/to/chromium-seccomp.json               ║\n"
-                        "╚══════════════════════════════════════════════════════════════╝\n"
-                    )
-                    logger.critical(_hint)
-                    raise RuntimeError(
-                        f"Chromium crashed with SIGTRAP (exit_code=-5). "
-                        f"Docker seccomp filter is blocking ARM64 syscalls. "
-                        f"Add 'security_opt: [seccomp=unconfined]' and "
-                        f"'shm_size: 1gb' to your container configuration."
-                    )
+                    if "0" not in _seccomp:
+                        _hint = (
+                            "\n\n"
+                            "╔══════════════════════════════════════════════════════════════╗\n"
+                            "║  CHROMIUM CRASHED WITH SIGTRAP (exit code -5)               ║\n"
+                            "║  Root cause: Docker seccomp filter is blocking ARM64        ║\n"
+                           f"║  syscalls used by Chromium. Seccomp mode: {_seccomp:<18}    ║\n"
+                            "║                                                             ║\n"
+                            "║  FIX — Add to your docker-compose.yml / Coolify:            ║\n"
+                            "║                                                             ║\n"
+                            "║    security_opt:                                            ║\n"
+                            "║      - seccomp=unconfined                                   ║\n"
+                            "║    shm_size: '1gb'                                          ║\n"
+                            "║    cap_add:                                                 ║\n"
+                            "║      - SYS_ADMIN                                            ║\n"
+                            "║                                                             ║\n"
+                            "║  OR use the minimal seccomp profile:                        ║\n"
+                            "║    security_opt:                                            ║\n"
+                            "║      - seccomp=/path/to/chromium-seccomp.json               ║\n"
+                            "╚══════════════════════════════════════════════════════════════╝\n"
+                        )
+                        logger.critical(_hint)
+                        raise RuntimeError(
+                            f"Chromium crashed with SIGTRAP (exit_code=-5). "
+                            f"Docker seccomp filter is blocking ARM64 syscalls. "
+                            f"Add 'security_opt: [seccomp=unconfined]' and "
+                            f"'shm_size: 1gb' to your container configuration."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Chromium crashed internally with SIGTRAP (exit_code=-5). "
+                            f"Seccomp is UNCONFINED, meaning this is an internal Chromium "
+                            f"assertion failure, not a Docker security issue. "
+                            f"Stderr: {browser_stderr[:1000]}"
+                        )
 
                 raise RuntimeError(
                     f"Chrome debug port {debug_host}:{debug_port} not ready after "
