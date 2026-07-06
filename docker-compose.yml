@@ -16,7 +16,7 @@ services:
     volumes:
       - ./config:/config  
     security_opt:
-      - seccomp=./config/chromium-seccomp.json
+      - seccomp=unconfined
     shm_size: '1gb'
     cap_add:
       - SYS_ADMIN
