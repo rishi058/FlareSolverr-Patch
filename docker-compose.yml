@@ -10,9 +10,9 @@ services:
       - LOG_FILE=${LOG_FILE:-none}
       - LOG_HTML=${LOG_HTML:-false}
       - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-none}
-      - TZ=Europe/London
+      - TZ=Asia/Kolkata
     ports:
       - "${PORT:-8191}:8191"
     volumes:
-      - ./config:/config
+      - ./config:/config  
     restart: unless-stopped
