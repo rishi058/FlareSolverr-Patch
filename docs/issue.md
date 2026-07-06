@@ -111,6 +111,17 @@ services:
       - SYS_ADMIN               # Permits Chrome sandbox setup
 ```
 
+### The Minimal Seccomp Profile (Recommended)
+Running `unconfined` disables all syscall filtering. For better security, you can use a custom minimal seccomp profile that only enables the specific ARM64 syscalls Chromium needs (like `clone3` and `pidfd_open`).
+
+1. Copy `config/chromium-seccomp.json` to your Docker host.
+2. In your Docker Compose or Coolify settings, use:
+```yaml
+    security_opt:
+      - seccomp=/path/to/chromium-seccomp.json
+    shm_size: '1gb'
+```
+
 ### Manual Host Diagnostics (How to verify)
 Since Coolify terminates the container before you can attach to it, you can run a temporary test container on the host terminal:
 

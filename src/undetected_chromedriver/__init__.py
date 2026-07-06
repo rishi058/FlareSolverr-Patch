@@ -489,17 +489,54 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             if port_ready:
                 logger.info("[UC] Chrome debug port is ready")
             else:
-                # Collect stderr from the still-running (or dead) browser process
+                # Chrome died or never opened the port.
+                # Read stderr quickly (non-blocking; Chrome is almost certainly dead)
                 try:
                     browser_stderr = browser.stderr.read(4096).decode(errors='replace')
                 except Exception:
                     browser_stderr = "<could not read stderr>"
                 rc = browser.poll()
+
                 logger.error(
                     "[UC] Chrome debug port %s:%s NOT ready after %ds. "
                     "Browser exit code: %s. Stderr:\n%s",
                     debug_host, debug_port, port_timeout, rc, browser_stderr
                 )
+
+                # ── Smart failure diagnosis ──────────────────────────────────
+                # Exit code -5 == SIGTRAP == Chromium's built-in abort() triggered
+                # by a blocked kernel syscall (seccomp filter).  This is 100% a
+                # container-level issue; no Python code can fix it.
+                if rc == -5:
+                    _seccomp = Chrome._read_seccomp_mode()
+                    _hint = (
+                        "\n\n"
+                        "╔══════════════════════════════════════════════════════════════╗\n"
+                        "║  CHROMIUM CRASHED WITH SIGTRAP (exit code -5)               ║\n"
+                        "║  Root cause: Docker seccomp filter is blocking ARM64        ║\n"
+                        f"║  syscalls used by Chromium. Seccomp mode: {_seccomp:<18}║\n"
+                        "║                                                              ║\n"
+                        "║  FIX — Add to your docker-compose.yml / Coolify:            ║\n"
+                        "║                                                              ║\n"
+                        "║    security_opt:                                             ║\n"
+                        "║      - seccomp=unconfined                                   ║\n"
+                        "║    shm_size: '1gb'                                          ║\n"
+                        "║    cap_add:                                                  ║\n"
+                        "║      - SYS_ADMIN                                            ║\n"
+                        "║                                                              ║\n"
+                        "║  OR use the minimal seccomp profile:                        ║\n"
+                        "║    security_opt:                                             ║\n"
+                        "║      - seccomp=/path/to/chromium-seccomp.json               ║\n"
+                        "╚══════════════════════════════════════════════════════════════╝\n"
+                    )
+                    logger.critical(_hint)
+                    raise RuntimeError(
+                        f"Chromium crashed with SIGTRAP (exit_code=-5). "
+                        f"Docker seccomp filter is blocking ARM64 syscalls. "
+                        f"Add 'security_opt: [seccomp=unconfined]' and "
+                        f"'shm_size: 1gb' to your container configuration."
+                    )
+
                 raise RuntimeError(
                     f"Chrome debug port {debug_host}:{debug_port} not ready after "
                     f"{port_timeout}s (exit_code={rc}). "
@@ -923,6 +960,29 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                     )
                 time.sleep(0.5)
         return False
+
+    @staticmethod
+    def _read_seccomp_mode() -> str:
+        """
+        Read the current process's seccomp mode from /proc/self/status.
+        Returns a human-readable string, e.g. '2 (BPF filter active)'.
+        Falls back gracefully on non-Linux systems.
+        """
+        # Seccomp modes: 0=disabled, 1=strict, 2=filter (BPF)
+        _mode_names = {
+            "0": "0 (disabled)",
+            "1": "1 (strict)",
+            "2": "2 (BPF filter active)",
+        }
+        try:
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("Seccomp:"):
+                        val = line.split(":")[1].strip()
+                        return _mode_names.get(val, val)
+        except OSError:
+            pass
+        return "unknown"
 
     @classmethod
     def _ensure_close(cls, self):

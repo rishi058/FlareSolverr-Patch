@@ -15,4 +15,9 @@ services:
       - "${PORT:-8191}:8191"
     volumes:
       - ./config:/config  
+    security_opt:
+      - seccomp=./config/chromium-seccomp.json
+    shm_size: '1gb'
+    cap_add:
+      - SYS_ADMIN
     restart: unless-stopped
