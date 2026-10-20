@@ -59,9 +59,8 @@ class V1RequestBase(object):
     post_endpoint: str = None
     # JSON body for the POST — either a dict or a JSON string
     post_json_body = None
-    # Optional Turnstile verification endpoint. Used when the target API
-    # responds with code=CHALLENGE_REQUIRED. Defaults to "api/verify".
-    verify_endpoint: str = None
+    # Optional caller-supplied recipe for a Turnstile verification handshake.
+    verification: dict = None
     # -------------------------------------------------------------------------
 
     def __init__(self, _dict):

@@ -44,10 +44,6 @@ _CF_SOLVE_TIMEOUT_MS = int(os.environ.get("CF_SOLVE_TIMEOUT_MS", "180000")) # 18
 _TURNSTILE_VERIFY_TIMEOUT_SECONDS = int(
     os.environ.get("TURNSTILE_VERIFY_TIMEOUT_SECONDS", "90")
 )
-_TURNSTILE_SITE_KEY = os.environ.get(
-    "TURNSTILE_SITE_KEY", "0x4AAAAAAFZJOCzA6dP3BIYH"
-)
-
 # Per-URL coalescing: only one inflight solve per base_url
 _url_locks: dict[str, threading.Lock] = {}
 _url_locks_guard = threading.Lock()
@@ -120,21 +116,22 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
 
     # ── Step 3: Complete the site's Turnstile verification when required ─
     # Some sites allow the initial Cloudflare page request but protect their
-    # API with a second Turnstile-backed /api/verify handshake. The resulting
-    # pass cookies must be cached alongside cf_clearance before retrying.
-    if _requires_verification(resp_data):
+    # API with a second Turnstile-backed handshake. The caller describes that
+    # handshake; its response cookies are cached before retrying the request.
+    verification = req.verification
+    if verification and _requires_verification(resp_data, status_code, verification):
         logging.info(f"[post2] API verification required for {base_url}")
-        failed_pass = _cookie_value(session, "tdl_pass")
+        failed_cached_at = session.get("cached_at")
         url_lock = _get_url_lock(base_url)
         with url_lock:
             latest_session = db.get(base_url)
-            latest_pass = _cookie_value(latest_session, "tdl_pass")
-            if latest_pass and latest_pass != failed_pass:
+            latest_cached_at = latest_session.get("cached_at") if latest_session else None
+            if latest_session is not None and latest_cached_at != failed_cached_at:
                 session = latest_session
             else:
                 _browser_semaphore.acquire()
                 try:
-                    session = _verify_and_cache(base_url, req.verify_endpoint)
+                    session = _verify_and_cache(base_url, verification)
                 finally:
                     _browser_semaphore.release()
 
@@ -247,41 +244,50 @@ def _solve_and_cache(base_url: str) -> dict | None:
     }
 
 
-def _requires_verification(response_data) -> bool:
-    """Return True for the site's Turnstile-gated API response."""
-    return (
-        isinstance(response_data, dict)
-        and response_data.get("code") == "CHALLENGE_REQUIRED"
-    )
+def _requires_verification(response_data, status_code: int, verification: dict) -> bool:
+    """Evaluate a caller-supplied trigger against the target response."""
+    trigger = verification.get("trigger") or {}
+    expected_status = trigger.get("status_code")
+    if expected_status is not None and status_code != expected_status:
+        return False
+
+    field = trigger.get("field")
+    if field is None:
+        return expected_status is not None
+    if not isinstance(response_data, dict):
+        return False
+    return response_data.get(field) == trigger.get("equals")
 
 
-def _cookie_value(session: dict | None, cookie_name: str) -> str | None:
-    if session is None:
-        return None
-    for cookie in session.get("cookies", []):
-        if cookie.get("name") == cookie_name:
-            return cookie.get("value") or None
-    return None
-
-
-def _verify_and_cache(base_url: str, verify_endpoint: str | None = None) -> dict | None:
+def _verify_and_cache(base_url: str, verification: dict) -> dict | None:
     """Solve the embedded Turnstile widget, verify it, and cache pass cookies."""
     driver = None
-    verify_url = urljoin(base_url, verify_endpoint or "api/verify")
+    endpoint = verification.get("endpoint")
+    site_key = verification.get("site_key")
+    token_field = verification.get("token_field")
+    if not endpoint or not site_key or not token_field:
+        logging.error(
+            "[post2] verification requires endpoint, site_key, and token_field"
+        )
+        return None
+
+    verify_url = urljoin(base_url, endpoint)
 
     try:
         driver = utils.get_webdriver(None)
         driver.get(base_url)
-        token = _wait_for_turnstile_token(driver)
+        token = _wait_for_turnstile_token(driver, site_key)
 
         cookies = driver.get_cookies() or []
         user_agent = utils.get_user_agent(driver)
         headers = _request_headers(verify_url, user_agent)
+        verify_body = dict(verification.get("body") or {})
+        verify_body[token_field] = token
         response = stdlib_requests.post(
             verify_url,
             headers=headers,
             cookies={cookie["name"]: cookie["value"] for cookie in cookies},
-            json={"token": token},
+            json=verify_body,
             timeout=60,
         )
 
@@ -290,7 +296,18 @@ def _verify_and_cache(base_url: str, verify_endpoint: str | None = None) -> dict
         except Exception:
             response_data = None
 
-        if response.status_code != 200 or not isinstance(response_data, dict) or not response_data.get("success"):
+        expected_status = verification.get("success_status", 200)
+        success_field = verification.get("success_field")
+        success_value = verification.get("success_value", True)
+        verified = response.status_code == expected_status
+        if success_field is not None:
+            verified = (
+                verified
+                and isinstance(response_data, dict)
+                and response_data.get(success_field) == success_value
+            )
+
+        if not verified:
             logging.error(
                 "[post2] Turnstile verification failed for %s: HTTP %s body=%s",
                 base_url,
@@ -317,7 +334,7 @@ def _verify_and_cache(base_url: str, verify_endpoint: str | None = None) -> dict
                 logging.debug("[post2] Failed to close Turnstile browser", exc_info=True)
 
 
-def _wait_for_turnstile_token(driver) -> str:
+def _wait_for_turnstile_token(driver, site_key: str) -> str:
     """Render the site's Turnstile widget and wait until it emits a token."""
     deadline = time.monotonic() + _TURNSTILE_VERIFY_TIMEOUT_SECONDS
     clicked_frames = set()
@@ -369,7 +386,7 @@ def _wait_for_turnstile_token(driver) -> str:
                   return false;
                 }
                 """,
-                _TURNSTILE_SITE_KEY,
+                site_key,
             ))
         else:
             # The site loads Turnstile after the first user interaction.

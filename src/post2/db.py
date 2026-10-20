@@ -55,7 +55,7 @@ def put(base_url: str, cookies: list, headers: dict) -> None:
         db[base_url] = {
             "cookies": cookies,
             "headers": headers,
-            "cached_at": int(time.time()),
+            "cached_at": int(time.time() * 1000),
         }
         _save(db)
     logging.info(f"[post2/db] Cached session for {base_url}")
