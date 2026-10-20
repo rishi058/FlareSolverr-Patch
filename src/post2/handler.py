@@ -238,10 +238,9 @@ def _solve_and_cache(base_url: str) -> dict | None:
     db.put(base_url, cookies, headers)
     logging.info(f"[post2] Challenge solved for {base_url}, full session cached.")
 
-    return {
-        "cookies": cookies,
-        "headers": headers,
-    }
+    # Return the persisted record so cached_at can distinguish this session
+    # from a verification refresh performed by a concurrent request.
+    return db.get(base_url)
 
 
 def _requires_verification(response_data, status_code: int, verification: dict) -> bool:
