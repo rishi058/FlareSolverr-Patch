@@ -21,12 +21,11 @@ WORKDIR /app
     # Install dummy packages
 RUN dpkg -i /libgl1-mesa-dri.deb \
     && dpkg -i /adwaita-icon-theme.deb \
-    # Install dependencies with strictly pinned Chromium versions
+    # Install Chromium and its matching driver from the same repository snapshot.
+    # Exact Debian security versions are short-lived and disappear on updates.
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-       chromium=147.0.7727.137-1~deb12u1 \
-       chromium-common=147.0.7727.137-1~deb12u1 \
-       chromium-driver=147.0.7727.137-1~deb12u1 \
+       chromium chromium-common chromium-driver \
        xvfb dumb-init procps curl vim xauth \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
