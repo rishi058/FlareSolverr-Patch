@@ -19,9 +19,12 @@ import time
 from urllib.parse import urljoin
 
 import requests as stdlib_requests
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
 
 from dtos import STATUS_OK, STATUS_ERROR, V1RequestBase, V1ResponseBase
 from post2 import db
+import utils
 
 
 # ──────────────────────────────────────────────
@@ -38,6 +41,12 @@ _browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
 # the outer client can have a shorter timeout and retry independently.
 # Render free containers are slow: 120 s gives Chrome a realistic window.
 _CF_SOLVE_TIMEOUT_MS = int(os.environ.get("CF_SOLVE_TIMEOUT_MS", "180000")) # 180s = 3 min
+_TURNSTILE_VERIFY_TIMEOUT_SECONDS = int(
+    os.environ.get("TURNSTILE_VERIFY_TIMEOUT_SECONDS", "90")
+)
+_TURNSTILE_SITE_KEY = os.environ.get(
+    "TURNSTILE_SITE_KEY", "0x4AAAAAAFZJOCzA6dP3BIYH"
+)
 
 # Per-URL coalescing: only one inflight solve per base_url
 _url_locks: dict[str, threading.Lock] = {}
@@ -109,8 +118,31 @@ def cmd_request_post2(req: V1RequestBase) -> V1ResponseBase:
     # ── Step 2: Make the JSON POST ────────────────────────────────────────
     resp_data, status_code, error = _do_post(post_url, json_body, session)
 
-    # ── Step 3: Handle 403 (stale cookie) — ONE retry ────────────────────
-    if status_code == 403:
+    # ── Step 3: Complete the site's Turnstile verification when required ─
+    # Some sites allow the initial Cloudflare page request but protect their
+    # API with a second Turnstile-backed /api/verify handshake. The resulting
+    # pass cookies must be cached alongside cf_clearance before retrying.
+    if _requires_verification(resp_data):
+        logging.info(f"[post2] API verification required for {base_url}")
+        failed_pass = _cookie_value(session, "tdl_pass")
+        url_lock = _get_url_lock(base_url)
+        with url_lock:
+            latest_session = db.get(base_url)
+            latest_pass = _cookie_value(latest_session, "tdl_pass")
+            if latest_pass and latest_pass != failed_pass:
+                session = latest_session
+            else:
+                _browser_semaphore.acquire()
+                try:
+                    session = _verify_and_cache(base_url, req.verify_endpoint)
+                finally:
+                    _browser_semaphore.release()
+
+        if session is not None:
+            resp_data, status_code, error = _do_post(post_url, json_body, session)
+
+    # ── Step 4: Handle remaining 403s (stale cookie) — ONE retry ─────────
+    elif status_code == 403:
         logging.info(f"[post2] Got 403 — evicting cache and retrying once for {base_url}")
         db.remove(base_url)
         url_lock = _get_url_lock(base_url)
@@ -215,6 +247,198 @@ def _solve_and_cache(base_url: str) -> dict | None:
     }
 
 
+def _requires_verification(response_data) -> bool:
+    """Return True for the site's Turnstile-gated API response."""
+    return (
+        isinstance(response_data, dict)
+        and response_data.get("code") == "CHALLENGE_REQUIRED"
+    )
+
+
+def _cookie_value(session: dict | None, cookie_name: str) -> str | None:
+    if session is None:
+        return None
+    for cookie in session.get("cookies", []):
+        if cookie.get("name") == cookie_name:
+            return cookie.get("value") or None
+    return None
+
+
+def _verify_and_cache(base_url: str, verify_endpoint: str | None = None) -> dict | None:
+    """Solve the embedded Turnstile widget, verify it, and cache pass cookies."""
+    driver = None
+    verify_url = urljoin(base_url, verify_endpoint or "api/verify")
+
+    try:
+        driver = utils.get_webdriver(None)
+        driver.get(base_url)
+        token = _wait_for_turnstile_token(driver)
+
+        cookies = driver.get_cookies() or []
+        user_agent = utils.get_user_agent(driver)
+        headers = _request_headers(verify_url, user_agent)
+        response = stdlib_requests.post(
+            verify_url,
+            headers=headers,
+            cookies={cookie["name"]: cookie["value"] for cookie in cookies},
+            json={"token": token},
+            timeout=60,
+        )
+
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = None
+
+        if response.status_code != 200 or not isinstance(response_data, dict) or not response_data.get("success"):
+            logging.error(
+                "[post2] Turnstile verification failed for %s: HTTP %s body=%s",
+                base_url,
+                response.status_code,
+                response_data if response_data is not None else response.text,
+            )
+            return None
+
+        cookies = _merge_response_cookies(cookies, response.cookies)
+        session = {"cookies": cookies, "headers": {"User-Agent": user_agent}}
+        db.put(base_url, session["cookies"], session["headers"])
+        logging.info(f"[post2] Turnstile verification completed for {base_url}")
+        return session
+    except Exception as exc:
+        logging.error(f"[post2] Turnstile verification error for {base_url}: {exc}")
+        return None
+    finally:
+        if driver is not None:
+            try:
+                if utils.PLATFORM_VERSION == "nt":
+                    driver.close()
+                driver.quit()
+            except Exception:
+                logging.debug("[post2] Failed to close Turnstile browser", exc_info=True)
+
+
+def _wait_for_turnstile_token(driver) -> str:
+    """Render the site's Turnstile widget and wait until it emits a token."""
+    deadline = time.monotonic() + _TURNSTILE_VERIFY_TIMEOUT_SECONDS
+    clicked_frames = set()
+    widget_rendered = False
+
+    while time.monotonic() < deadline:
+        token = driver.execute_script(
+            """
+            if (window.__flaresolverrTurnstileToken) {
+              return window.__flaresolverrTurnstileToken;
+            }
+            const inputs = document.querySelectorAll(
+              'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+            );
+            for (const input of inputs) {
+              if (input.value) return input.value;
+            }
+            return null;
+            """
+        )
+        if token:
+            return token
+
+        turnstile_available = driver.execute_script(
+            "return typeof window.turnstile === 'object';"
+        )
+        if turnstile_available and not widget_rendered:
+            widget_rendered = bool(driver.execute_script(
+                """
+                const siteKey = arguments[0];
+                let container = document.getElementById('flaresolverr-turnstile');
+                if (!container) {
+                  container = document.createElement('div');
+                  container.id = 'flaresolverr-turnstile';
+                  container.style.cssText =
+                    'position:fixed;z-index:2147483647;top:20px;left:20px';
+                  document.body.appendChild(container);
+                }
+                try {
+                  window.turnstile.render(container, {
+                    sitekey: siteKey,
+                    appearance: 'always',
+                    callback: token => {
+                      window.__flaresolverrTurnstileToken = token;
+                    }
+                  });
+                  return true;
+                } catch (error) {
+                  return false;
+                }
+                """,
+                _TURNSTILE_SITE_KEY,
+            ))
+        else:
+            # The site loads Turnstile after the first user interaction.
+            try:
+                ActionChains(driver).move_by_offset(1, 1).click().perform()
+            except Exception:
+                driver.execute_script(
+                    "window.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true}));"
+                )
+
+        frames = driver.find_elements(
+            By.CSS_SELECTOR,
+            'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]',
+        )
+        for frame in frames:
+            frame_id = getattr(frame, "id", str(frame))
+            if frame_id in clicked_frames:
+                continue
+            try:
+                driver.switch_to.frame(frame)
+                checkboxes = driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
+                if checkboxes:
+                    checkboxes[0].click()
+                else:
+                    driver.switch_to.default_content()
+                    ActionChains(driver).move_to_element(frame).click().perform()
+                clicked_frames.add(frame_id)
+            except Exception:
+                logging.debug("[post2] Turnstile frame click failed", exc_info=True)
+            finally:
+                driver.switch_to.default_content()
+
+        time.sleep(1)
+
+    raise TimeoutError("Timed out waiting for a Turnstile verification token")
+
+
+def _merge_response_cookies(cookies: list, response_cookies) -> list:
+    """Merge requests response cookies into Selenium-style cookie records."""
+    merged = {cookie["name"]: dict(cookie) for cookie in cookies}
+    for cookie in response_cookies:
+        record = {
+            "name": cookie.name,
+            "value": cookie.value,
+            "path": cookie.path or "/",
+            "secure": cookie.secure,
+        }
+        if cookie.domain:
+            record["domain"] = cookie.domain
+        if cookie.expires:
+            record["expiry"] = cookie.expires
+        merged[cookie.name] = record
+    return list(merged.values())
+
+
+def _request_headers(post_url: str, user_agent: str) -> dict:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(post_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "User-Agent": user_agent,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Referer": origin + "/",
+    }
+
+
 def _do_post(post_url: str, json_body: dict, session: dict):
     """
     Make a JSON POST to post_url using the given session (userAgent + cookies).
@@ -225,19 +449,7 @@ def _do_post(post_url: str, json_body: dict, session: dict):
     # Selenium returns cookies as list of dicts; requests needs name→value dict
     cookies_dict = {c["name"]: c["value"] for c in cookies_list}
 
-    # Derive Origin / Referer from the base URL embedded in post_url
-    from urllib.parse import urlparse
-    parsed = urlparse(post_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    referer = origin + "/"
-
-    headers = {
-        "User-Agent": session["headers"].get("User-Agent", ""),
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": origin,
-        "Referer": referer,
-    }
+    headers = _request_headers(post_url, session["headers"].get("User-Agent", ""))
 
     try:
         resp = stdlib_requests.post(
